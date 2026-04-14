@@ -2,14 +2,10 @@
 predict.py — загружает обученные артефакты и предоставляет функцию predict().
 
 Использование:
-    from predict import predict
+    from predict import predict, predict_batch
 
-    # Без session_id → глобальный fallback (SparseTPS)
     x_door2, y_door2 = predict(743.96, 524.59, source="top")
-
-    # С session_id → per-session гомография (точнее, если сессия есть в train)
-    x_door2, y_door2 = predict(743.96, 524.59, source="top",
-                                session_id="camera_door2_2025-11-27_14-26-36")
+    x_door2, y_door2 = predict(512.0,  300.0,  source="bottom")
 """
 
 import pickle
@@ -26,7 +22,7 @@ ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 _model_cache: dict = {}
 
 
-def _load_model(source: str) -> SessionAwareMapper:
+def _load_model(source: str):
     if source not in _model_cache:
         path = ARTIFACTS_DIR / f"mapper_{source}.pkl"
         if not path.exists():
@@ -41,16 +37,14 @@ def _load_model(source: str) -> SessionAwareMapper:
     return _model_cache[source]
 
 
-def predict(x: float, y: float, source: str,
-            session_id: str = None) -> tuple[float, float]:
+def predict(x: float, y: float, source: str) -> tuple[float, float]:
     """
     Маппинг пиксельной координаты из камеры source на вид door2.
 
     Args:
-        x          : координата X на кадре камеры source
-        y          : координата Y на кадре камеры source
-        source     : "top" или "bottom"
-        session_id : имя сессии (опционально, улучшает точность для train-сессий)
+        x      : координата X на кадре камеры source
+        y      : координата Y на кадре камеры source
+        source : "top" или "bottom"
 
     Returns:
         (x', y') — предсказанная пиксельная координата на кадре door2
@@ -60,20 +54,23 @@ def predict(x: float, y: float, source: str,
 
     model = _load_model(source)
     pts   = np.array([[x, y]], dtype=np.float32)
-    pred  = model.predict(pts, session_id=session_id)
+
+    # Поддержка как SessionAwareMapper, так и простых моделей
+    if hasattr(model, "predict") and "session_id" in model.predict.__code__.co_varnames:
+        pred = model.predict(pts, session_id=None)
+    else:
+        pred = model.predict(pts)
 
     return float(pred[0, 0]), float(pred[0, 1])
 
 
-def predict_batch(points: list[tuple[float, float]], source: str,
-                  session_id: str = None) -> list[tuple[float, float]]:
+def predict_batch(points: list[tuple[float, float]], source: str) -> list[tuple[float, float]]:
     """
-    Батч-версия predict для нескольких точек одной сессии.
+    Батч-версия predict для нескольких точек.
 
     Args:
-        points     : список (x, y) координат на камере source
-        source     : "top" или "bottom"
-        session_id : имя сессии (опционально)
+        points : список (x, y) координат на камере source
+        source : "top" или "bottom"
 
     Returns:
         список (x', y') координат на door2
@@ -83,7 +80,11 @@ def predict_batch(points: list[tuple[float, float]], source: str,
 
     model = _load_model(source)
     pts   = np.array(points, dtype=np.float32)
-    pred  = model.predict(pts, session_id=session_id)
+
+    if hasattr(model, "predict") and "session_id" in model.predict.__code__.co_varnames:
+        pred = model.predict(pts, session_id=None)
+    else:
+        pred = model.predict(pts)
 
     return [(float(pred[i, 0]), float(pred[i, 1])) for i in range(len(pred))]
 

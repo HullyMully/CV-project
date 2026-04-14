@@ -15,7 +15,7 @@ from pathlib import Path
 # Импорт нужен чтобы pickle мог восстановить классы моделей
 from models import (  # noqa: F401
     HomographyMapper, NormalizedPolyMapper, SparseTPS,
-    SessionAwareMapper, PolyMapper, TPSMapper,
+    ZonalEnsemble, PolyMapper, TPSMapper, SessionAwareMapper,
 )
 
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
@@ -54,13 +54,7 @@ def predict(x: float, y: float, source: str) -> tuple[float, float]:
 
     model = _load_model(source)
     pts   = np.array([[x, y]], dtype=np.float32)
-
-    # Поддержка как SessionAwareMapper, так и простых моделей
-    if hasattr(model, "predict") and "session_id" in model.predict.__code__.co_varnames:
-        pred = model.predict(pts, session_id=None)
-    else:
-        pred = model.predict(pts)
-
+    pred  = model.predict(pts)
     return float(pred[0, 0]), float(pred[0, 1])
 
 
@@ -80,12 +74,7 @@ def predict_batch(points: list[tuple[float, float]], source: str) -> list[tuple[
 
     model = _load_model(source)
     pts   = np.array(points, dtype=np.float32)
-
-    if hasattr(model, "predict") and "session_id" in model.predict.__code__.co_varnames:
-        pred = model.predict(pts, session_id=None)
-    else:
-        pred = model.predict(pts)
-
+    pred  = model.predict(pts)
     return [(float(pred[i, 0]), float(pred[i, 1])) for i in range(len(pred))]
 
 

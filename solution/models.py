@@ -1,7 +1,9 @@
 """
-models.py — классы моделей маппинга координат.
+models.py — классы моделей маппинга координат. v4: ZonalEnsemble.
 
-v3: добавлен SessionAwareMapper — per-session гомография + глобальный SparseTPS fallback.
+Ключевая идея: разбить пространство входных координат на зоны
+и обучить отдельный SparseTPS для каждой зоны с перекрытием (overlap).
+Предсказание = взвешенная сумма моделей ближайших зон.
 """
 
 import numpy as np
@@ -12,41 +14,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.cluster import KMeans
 
 
-# ─── 1. Полиномиальная регрессия с нормализацией ──────────────────────────────
-
-class NormalizedPolyMapper:
-    def __init__(self, degree: int = 2, alpha: float = 0.01):
-        self.degree = degree
-        self.alpha = alpha
-        self.src_mean = None
-        self.src_std  = None
-        self.model_x  = None
-        self.model_y  = None
-
-    def _normalize(self, pts):
-        return (pts - self.src_mean) / self.src_std
-
-    def fit(self, src, dst):
-        self.src_mean = src.mean(axis=0)
-        self.src_std  = src.std(axis=0) + 1e-8
-        src_n = self._normalize(src)
-        self.model_x = Pipeline([("poly", PolynomialFeatures(self.degree, include_bias=True)),
-                                  ("ridge", Ridge(alpha=self.alpha, fit_intercept=False))])
-        self.model_y = Pipeline([("poly", PolynomialFeatures(self.degree, include_bias=True)),
-                                  ("ridge", Ridge(alpha=self.alpha, fit_intercept=False))])
-        self.model_x.fit(src_n, dst[:, 0])
-        self.model_y.fit(src_n, dst[:, 1])
-        return self
-
-    def predict(self, pts):
-        src_n = self._normalize(pts)
-        return np.stack([self.model_x.predict(src_n), self.model_y.predict(src_n)], axis=1)
-
-
-# ─── 2. Sparse TPS ────────────────────────────────────────────────────────────
+# ─── SparseTPS ────────────────────────────────────────────────────────────────
 
 class SparseTPS:
-    def __init__(self, n_ctrl: int = 150, regularization: float = 1.0):
+    def __init__(self, n_ctrl: int = 150, regularization: float = 0.1):
         self.n_ctrl = n_ctrl
         self.reg = regularization
         self.ctrl_pts  = None
@@ -93,7 +64,39 @@ class SparseTPS:
         return np.stack([A @ self.weights_x, A @ self.weights_y], axis=1).astype(np.float32)
 
 
-# ─── 3. Гомография ────────────────────────────────────────────────────────────
+# ─── NormalizedPolyMapper ─────────────────────────────────────────────────────
+
+class NormalizedPolyMapper:
+    def __init__(self, degree: int = 2, alpha: float = 0.01):
+        self.degree = degree
+        self.alpha = alpha
+        self.src_mean = None
+        self.src_std  = None
+        self.model_x  = None
+        self.model_y  = None
+
+    def _normalize(self, pts):
+        return (pts - self.src_mean) / self.src_std
+
+    def fit(self, src, dst):
+        self.src_mean = src.mean(axis=0)
+        self.src_std  = src.std(axis=0) + 1e-8
+        src_n = self._normalize(src)
+        self.model_x = Pipeline([("poly", PolynomialFeatures(self.degree, include_bias=True)),
+                                  ("ridge", Ridge(alpha=self.alpha, fit_intercept=False))])
+        self.model_y = Pipeline([("poly", PolynomialFeatures(self.degree, include_bias=True)),
+                                  ("ridge", Ridge(alpha=self.alpha, fit_intercept=False))])
+        self.model_x.fit(src_n, dst[:, 0])
+        self.model_y.fit(src_n, dst[:, 1])
+        return self
+
+    def predict(self, pts):
+        src_n = self._normalize(pts)
+        return np.stack([self.model_x.predict(src_n),
+                         self.model_y.predict(src_n)], axis=1)
+
+
+# ─── HomographyMapper ─────────────────────────────────────────────────────────
 
 class HomographyMapper:
     def __init__(self):
@@ -111,68 +114,119 @@ class HomographyMapper:
         return (proj[:, :2] / proj[:, 2:3]).astype(np.float32)
 
 
-# ─── 4. SessionAwareMapper — главная модель ───────────────────────────────────
+# ─── ZonalEnsemble — главная модель ──────────────────────────────────────────
 
-class SessionAwareMapper:
+class ZonalEnsemble:
     """
-    Стратегия: каждая сессия имеет свои размеченные точки → считаем
-    per-session гомографию. При инференсе:
-      - если session_id известен и точек ≥ 4 → используем локальную гомографию
-      - иначе → глобальный SparseTPS fallback
+    Разбивает входное пространство (координаты source-камеры) на n_zones зон
+    через k-means. Для каждой зоны обучает отдельный SparseTPS на точках
+    этой зоны + соседних (overlap через sigma-взвешивание).
 
-    При обучении (fit) session_id = индекс сессии в списке.
-    При предсказании без session_id автоматически используется fallback.
+    Предсказание: взвешенная сумма по всем зонам, вес = exp(-d²/2σ²).
     """
 
-    MIN_POINTS_FOR_HOMOGRAPHY = 4
-
-    def __init__(self, n_ctrl: int = 200, regularization: float = 0.5):
-        self.n_ctrl = n_ctrl
-        self.regularization = regularization
-        # session_id (str) → HomographyMapper
-        self.session_models: dict = {}
+    def __init__(self, n_zones: int = 9, n_ctrl_per_zone: int = 80,
+                 regularization: float = 0.1, overlap_sigma: float = 0.4):
+        self.n_zones        = n_zones
+        self.n_ctrl         = n_ctrl_per_zone
+        self.reg            = regularization
+        self.sigma          = overlap_sigma   # в нормализованных единицах
+        self.zone_centers   = None            # (n_zones, 2) нормализованные
+        self.zone_models    = []              # список SparseTPS
+        self.src_mean       = None
+        self.src_std        = None
         # Глобальный fallback
-        self.global_model: SparseTPS = None
+        self.global_model   = None
 
-    def fit(self, src_pts, dst_pts, session_ids=None):
+    def _normalize(self, pts):
+        return (pts - self.src_mean) / self.src_std
+
+    def _zone_weights(self, pts_n):
         """
-        src_pts      : (N, 2)
-        dst_pts      : (N, 2)
-        session_ids  : (N,) array of str/int — к какой сессии принадлежит точка
+        pts_n : (M, 2) нормализованные координаты точек запроса
+        returns: (M, n_zones) веса (сумма по зонам = 1 для каждой точки)
         """
-        # 1. Глобальный fallback на всех данных
-        print(f"    Обучаю глобальный SparseTPS ({self.n_ctrl} опорных точек)...")
-        self.global_model = SparseTPS(n_ctrl=self.n_ctrl, regularization=self.regularization)
-        self.global_model.fit(src_pts, dst_pts)
+        # d[i, z] = расстояние от точки i до центра зоны z
+        diff = pts_n[:, None, :] - self.zone_centers[None, :, :]  # (M, Z, 2)
+        d2   = (diff ** 2).sum(axis=2)                             # (M, Z)
+        w    = np.exp(-d2 / (2 * self.sigma ** 2))
+        w   /= w.sum(axis=1, keepdims=True) + 1e-12
+        return w
 
-        # 2. Per-session гомографии
-        if session_ids is not None:
-            unique_sessions = np.unique(session_ids)
-            print(f"    Обучаю per-session гомографии для {len(unique_sessions)} сессий...")
-            for sid in unique_sessions:
-                mask = session_ids == sid
-                s = src_pts[mask]
-                d = dst_pts[mask]
-                if len(s) >= self.MIN_POINTS_FOR_HOMOGRAPHY:
-                    try:
-                        h = HomographyMapper()
-                        h.fit(s, d)
-                        self.session_models[str(sid)] = h
-                    except Exception:
-                        pass  # fallback покроет
+    def fit(self, src, dst):
+        # Нормализация
+        self.src_mean = src.mean(axis=0)
+        self.src_std  = src.std(axis=0) + 1e-8
+        src_n = self._normalize(src)
 
+        # 1. Глобальная модель (fallback + стабилизация)
+        print(f"      Глобальная модель...", end=" ", flush=True)
+        self.global_model = SparseTPS(n_ctrl=300, regularization=0.1)
+        self.global_model.fit(src, dst)
+        print("OK")
+
+        # 2. K-means по входным координатам → центры зон
+        n_zones = min(self.n_zones, len(src_n) // 20)
+        km = KMeans(n_clusters=n_zones, n_init=5, random_state=42)
+        km.fit(src_n)
+        self.zone_centers = km.cluster_centers_.astype(np.float32)  # (Z, 2)
+        self.n_zones = n_zones
+
+        # 3. Для каждой зоны — обучаем локальный SparseTPS
+        # Точки берём с мягким взвешиванием: все точки, но ближние имеют больший вес
+        print(f"      Зональные модели ({n_zones} зон)...", end=" ", flush=True)
+        self.zone_models = []
+
+        # Расстояния от каждой точки до каждой зоны
+        diff = src_n[:, None, :] - self.zone_centers[None, :, :]  # (N, Z, 2)
+        d2   = (diff ** 2).sum(axis=2)                             # (N, Z)
+
+        for z in range(n_zones):
+            # Берём точки, для которых эта зона — одна из 3 ближайших
+            nearest = np.argsort(d2, axis=1)[:, :3]  # (N, 3)
+            mask = (nearest == z).any(axis=1)
+
+            # Минимум 30 точек, иначе берём ближайшие 30
+            if mask.sum() < 30:
+                mask = np.argsort(d2[:, z])[:30]
+                mask_idx = mask
+            else:
+                mask_idx = np.where(mask)[0]
+
+            zone_src = src[mask_idx]
+            zone_dst = dst[mask_idx]
+
+            n_ctrl = min(self.n_ctrl, len(zone_src))
+            try:
+                m = SparseTPS(n_ctrl=n_ctrl, regularization=self.reg)
+                m.fit(zone_src, zone_dst)
+                self.zone_models.append(m)
+            except Exception:
+                # Fallback: используем глобальную
+                self.zone_models.append(None)
+
+        print("OK")
         return self
 
-    def predict(self, pts, session_id=None):
-        """
-        pts        : (N, 2)
-        session_id : str/int или None → использует глобальный fallback
-        """
-        if session_id is not None and str(session_id) in self.session_models:
-            return self.session_models[str(session_id)].predict(pts)
-        return self.global_model.predict(pts)
+    def predict(self, pts):
+        pts_n = self._normalize(pts)
+        weights = self._zone_weights(pts_n)  # (M, Z)
+
+        # Собираем предсказания всех зон: (M, Z, 2)
+        M = len(pts)
+        preds = np.zeros((M, self.n_zones, 2), dtype=np.float32)
+        for z, model in enumerate(self.zone_models):
+            if model is not None:
+                preds[:, z, :] = model.predict(pts)
+            else:
+                preds[:, z, :] = self.global_model.predict(pts)
+
+        # Взвешенная сумма: (M, 2)
+        result = (preds * weights[:, :, None]).sum(axis=1)
+        return result.astype(np.float32)
 
 
-# ─── Алиасы ───────────────────────────────────────────────────────────────────
-PolyMapper = NormalizedPolyMapper
-TPSMapper  = SparseTPS
+# ─── Алиасы для обратной совместимости ───────────────────────────────────────
+PolyMapper        = NormalizedPolyMapper
+TPSMapper         = SparseTPS
+SessionAwareMapper = ZonalEnsemble  # совместимость с predict.py

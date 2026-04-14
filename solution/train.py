@@ -1,12 +1,13 @@
 """
-train.py — обучает лучшую глобальную модель маппинга координат.
+train.py — обучает ZonalEnsemble для top→door2 и bottom→door2.
 
-Стратегия:
-  - Session-CV для честной оценки (fold = группа сессий)
-  - Grid search по n_ctrl и regularization для SparseTPS
-  - Финальное обучение на всех train-данных
+ZonalEnsemble:
+  - делит входное пространство на n_zones зон (k-means)
+  - для каждой зоны обучает локальный SparseTPS
+  - предсказание = взвешенная сумма по зонам (Gaussian weights)
+  - глобальный SparseTPS как fallback
 
-Артефакты сохраняются в artifacts/
+Grid search по n_zones и overlap_sigma.
 """
 
 import json
@@ -14,7 +15,7 @@ import pickle
 import numpy as np
 from pathlib import Path
 
-from models import SparseTPS, NormalizedPolyMapper
+from models import ZonalEnsemble, SparseTPS
 
 DATA_ROOT  = Path("/Users/hullymully/Documents/development/Projects/CV-project/test-task/")
 SPLIT_FILE = DATA_ROOT / "split.json"
@@ -27,7 +28,6 @@ SOURCES = ["top", "bottom"]
 def load_point_pairs(session_dirs, source):
     coord_file = f"coords_{source}.json"
     src_list, dst_list, sid_list = [], [], []
-
     for session_dir in session_dirs:
         json_path = session_dir / coord_file
         if not json_path.exists():
@@ -42,7 +42,6 @@ def load_point_pairs(session_dirs, source):
                 src_list.append(img2[num])
                 dst_list.append(img1[num])
                 sid_list.append(sid)
-
     src_pts     = np.array(src_list, dtype=np.float32)
     dst_pts     = np.array(dst_list, dtype=np.float32)
     session_ids = np.array(sid_list)
@@ -55,7 +54,6 @@ def med(pred, true):
 
 
 def session_cv(src_pts, dst_pts, session_ids, model_fn, n_folds=5):
-    """K-fold CV по сессиям (не по точкам)."""
     unique = np.unique(session_ids)
     np.random.shuffle(unique)
     folds = np.array_split(unique, n_folds)
@@ -63,7 +61,7 @@ def session_cv(src_pts, dst_pts, session_ids, model_fn, n_folds=5):
     for val_sessions in folds:
         val_mask = np.isin(session_ids, val_sessions)
         trn_mask = ~val_mask
-        if trn_mask.sum() < 20 or val_mask.sum() < 4:
+        if trn_mask.sum() < 50 or val_mask.sum() < 4:
             continue
         try:
             m = model_fn()
@@ -84,49 +82,50 @@ def train(source, session_dirs):
     src_pts, dst_pts, session_ids = load_point_pairs(session_dirs, source)
     np.random.seed(42)
 
-    # ── Grid search по гиперпараметрам ────────────────────────────────────────
-    print("\n  Grid search (SparseTPS):")
+    # Grid search
+    print("\n  Grid search (ZonalEnsemble):")
     grid = [
-        {"n_ctrl": 200, "regularization": 0.1},
-        {"n_ctrl": 200, "regularization": 1.0},
-        {"n_ctrl": 300, "regularization": 0.1},
-        {"n_ctrl": 300, "regularization": 1.0},
-        {"n_ctrl": 400, "regularization": 0.1},
-        {"n_ctrl": 400, "regularization": 0.5},
+        {"n_zones": 6,  "n_ctrl_per_zone": 80,  "overlap_sigma": 0.5},
+        {"n_zones": 9,  "n_ctrl_per_zone": 80,  "overlap_sigma": 0.4},
+        {"n_zones": 9,  "n_ctrl_per_zone": 80,  "overlap_sigma": 0.6},
+        {"n_zones": 12, "n_ctrl_per_zone": 60,  "overlap_sigma": 0.4},
+        {"n_zones": 16, "n_ctrl_per_zone": 50,  "overlap_sigma": 0.35},
     ]
 
-    best_med  = float("inf")
-    best_params = None
+    best_med_val  = float("inf")
+    best_params   = None
 
     for params in grid:
-        fn = lambda p=params: SparseTPS(**p)
+        fn = lambda p=params: ZonalEnsemble(**p)
         cv_med = session_cv(src_pts, dst_pts, session_ids, fn, n_folds=5)
-        marker = " ✓" if cv_med < best_med else ""
-        print(f"    n_ctrl={params['n_ctrl']:3d}  reg={params['regularization']:.1f}"
+        marker = " ✓" if cv_med < best_med_val else ""
+        print(f"    zones={params['n_zones']:2d}  ctrl={params['n_ctrl_per_zone']:3d}"
+              f"  sigma={params['overlap_sigma']:.2f}"
               f"  →  CV MED = {cv_med:.2f} px{marker}")
-        if cv_med < best_med:
-            best_med = cv_med
-            best_params = params
+        if cv_med < best_med_val:
+            best_med_val = cv_med
+            best_params  = params
 
-    # Poly3 как доп. кандидат
-    cv_poly3 = session_cv(src_pts, dst_pts, session_ids,
-                          lambda: NormalizedPolyMapper(degree=3, alpha=0.01), n_folds=5)
-    print(f"    poly3                     →  CV MED = {cv_poly3:.2f} px"
-          + (" ✓" if cv_poly3 < best_med else ""))
-    if cv_poly3 < best_med:
-        best_med    = cv_poly3
-        best_params = {"type": "poly3"}
+    # Сравниваем с глобальным SparseTPS
+    cv_global = session_cv(src_pts, dst_pts, session_ids,
+                           lambda: SparseTPS(n_ctrl=300, regularization=0.1), n_folds=5)
+    print(f"    global SparseTPS(300)         →  CV MED = {cv_global:.2f} px"
+          + (" ✓" if cv_global < best_med_val else ""))
+    if cv_global < best_med_val:
+        best_med_val = cv_global
+        best_params  = {"type": "global_tps"}
 
-    print(f"\n  ✓ Лучшие параметры: {best_params}  (CV MED = {best_med:.2f} px)")
+    print(f"\n  ✓ Лучшие параметры: {best_params}  (CV MED = {best_med_val:.2f} px)")
 
-    # ── Финальное обучение ────────────────────────────────────────────────────
+    # Финальное обучение
     print(f"  Финальное обучение на всех {len(src_pts)} точках...")
-    if best_params.get("type") == "poly3":
-        model = NormalizedPolyMapper(degree=3, alpha=0.01)
-        model_name = "poly3"
+    if best_params.get("type") == "global_tps":
+        model = SparseTPS(n_ctrl=300, regularization=0.1)
+        model_name = "sparse_tps_n300"
     else:
-        model = SparseTPS(**best_params)
-        model_name = f"sparse_tps_n{best_params['n_ctrl']}_r{best_params['regularization']}"
+        model = ZonalEnsemble(**best_params)
+        z, c, s = best_params["n_zones"], best_params["n_ctrl_per_zone"], best_params["overlap_sigma"]
+        model_name = f"zonal_z{z}_c{c}_s{s}"
 
     model.fit(src_pts, dst_pts)
 
@@ -135,7 +134,7 @@ def train(source, session_dirs):
         pickle.dump({"model": model, "model_name": model_name}, f)
     print(f"  Артефакт сохранён: {artifact_path}")
 
-    return {"source": source, "model_name": model_name, "cv_med": round(best_med, 4)}
+    return {"source": source, "model_name": model_name, "cv_med": round(best_med_val, 4)}
 
 
 def main():

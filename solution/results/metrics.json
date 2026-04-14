@@ -1,20 +1,20 @@
 {
   "top": {
-    "MED_px": 129.426,
-    "P50_px": 97.5969,
-    "P90_px": 268.0971,
-    "P95_px": 348.8102,
-    "coverage_50px_pct": 20.5,
-    "coverage_100px_pct": 51.45,
+    "MED_px": 127.7995,
+    "P50_px": 94.7428,
+    "P90_px": 267.9681,
+    "P95_px": 350.1407,
+    "coverage_50px_pct": 20.7,
+    "coverage_100px_pct": 53.19,
     "n_points": 1034
   },
   "bottom": {
-    "MED_px": 140.8974,
-    "P50_px": 104.0541,
-    "P90_px": 287.0125,
-    "P95_px": 376.6561,
-    "coverage_50px_pct": 20.41,
-    "coverage_100px_pct": 48.87,
+    "MED_px": 139.2571,
+    "P50_px": 102.7392,
+    "P90_px": 284.0133,
+    "P95_px": 364.1701,
+    "coverage_50px_pct": 21.34,
+    "coverage_100px_pct": 48.76,
     "n_points": 970
   }
 }

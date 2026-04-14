@@ -1,20 +1,26 @@
 {
   "top": {
-    "MED_px": 132.2557,
-    "P50_px": 98.215,
-    "P90_px": 273.3312,
-    "P95_px": 365.8463,
-    "coverage_50px_pct": 19.34,
-    "coverage_100px_pct": 50.19,
-    "n_points": 1034
+    "global": {
+      "MED_px": 131.096,
+      "P90_px": 270.5863,
+      "n_points": 1034
+    },
+    "per_session_homography": {
+      "MED_px": 1174.3232,
+      "P90_px": 1696.3857,
+      "calib_points_used": 8
+    }
   },
   "bottom": {
-    "MED_px": 145.6327,
-    "P50_px": 110.4327,
-    "P90_px": 293.454,
-    "P95_px": 374.7474,
-    "coverage_50px_pct": 17.32,
-    "coverage_100px_pct": 44.85,
-    "n_points": 970
+    "global": {
+      "MED_px": 143.4973,
+      "P90_px": 291.612,
+      "n_points": 970
+    },
+    "per_session_homography": {
+      "MED_px": 2498.8013,
+      "P90_px": 2889.6902,
+      "calib_points_used": 8
+    }
   }
 }

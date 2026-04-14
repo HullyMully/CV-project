@@ -1,12 +1,12 @@
 [
   {
     "source": "top",
-    "model_name": "sparse_tps",
-    "cv_med": 178.5408
+    "model_name": "session_aware",
+    "cv_med": 180.5331
   },
   {
     "source": "bottom",
-    "model_name": "sparse_tps",
-    "cv_med": 147.4363
+    "model_name": "session_aware",
+    "cv_med": 147.9364
   }
 ]
